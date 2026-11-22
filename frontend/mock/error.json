@@ -1,0 +1,5 @@
+{
+  "schema_version": "1.0", "request_id": "mock-error-001", "status": "error",
+  "message": "数据源响应超时，请稍后重试。", "data_source": null, "job": null, "diagnosis": null,
+  "error": {"code": "UPSTREAM_TIMEOUT", "message": "无法在规定时间内获取数据。"}
+}
