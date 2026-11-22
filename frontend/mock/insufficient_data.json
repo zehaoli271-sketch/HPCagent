@@ -1,0 +1,16 @@
+{
+  "schema_version": "1.0", "request_id": "mock-insufficient-001", "status": "insufficient_data",
+  "message": "普通步骤的 CPU 时间为零，尚不能确认统计完整性。以下为合成数据。",
+  "data_source": {"kind": "synthetic", "queried_at": "2026-11-22T10:00:00+08:00", "source_updated_at": null},
+  "job": {
+    "job_id": "10002", "state": "COMPLETED", "partition": "example-cpu", "allocated_cpus": 64,
+    "elapsed_seconds": 7200, "suspended_seconds": 0,
+    "cpu_efficiency": {"value": null, "quality": "unavailable", "reason": "普通步骤 CPU 时间为零，统计完整性未知"},
+    "steps": [
+      {"step_id": "10002.batch", "kind": "batch", "state": "COMPLETED", "allocated_cpus": 64, "elapsed_seconds": 7200, "cpu_time_seconds": 0.2, "max_rss_bytes": null},
+      {"step_id": "10002.0", "kind": "ordinary", "state": "COMPLETED", "allocated_cpus": 64, "elapsed_seconds": 7199, "cpu_time_seconds": 0, "max_rss_bytes": 1073741824}
+    ]
+  },
+  "diagnosis": {"facts": ["普通步骤报告的 CPU 时间为零。"], "hypotheses": [], "data_gaps": ["无法确认零值是否代表实际用量。"], "recommendations": ["与平台核对同一作业的 sacct 统计。"]},
+  "error": null
+}

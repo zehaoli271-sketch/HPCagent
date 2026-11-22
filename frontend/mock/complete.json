@@ -1,0 +1,24 @@
+{
+  "schema_version": "1.0",
+  "request_id": "mock-complete-001",
+  "status": "complete",
+  "message": "已完成示例作业分析。以下数据均为合成数据。",
+  "data_source": {"kind": "synthetic", "queried_at": "2026-11-22T10:00:00+08:00", "source_updated_at": null},
+  "job": {
+    "job_id": "10001", "state": "COMPLETED", "partition": "example-cpu", "allocated_cpus": 8,
+    "elapsed_seconds": 3700, "suspended_seconds": 100,
+    "cpu_efficiency": {"value": 0.25, "quality": "verified", "reason": "合成案例：CPU 时间和分配口径已知"},
+    "steps": [
+      {"step_id": "10001.batch", "kind": "batch", "state": "COMPLETED", "allocated_cpus": 8, "elapsed_seconds": 3700, "cpu_time_seconds": 360, "max_rss_bytes": 536870912},
+      {"step_id": "10001.0", "kind": "ordinary", "state": "COMPLETED", "allocated_cpus": 8, "elapsed_seconds": 3600, "cpu_time_seconds": 6840, "max_rss_bytes": 2147483648},
+      {"step_id": "10001.extern", "kind": "extern", "state": "COMPLETED", "allocated_cpus": 8, "elapsed_seconds": 3700, "cpu_time_seconds": 0, "max_rss_bytes": null}
+    ]
+  },
+  "diagnosis": {
+    "facts": ["合成案例的有效运行时间为 3600 秒，累计 CPU 时间为 7200 CPU 秒。", "作业平均 CPU 效率为 25%。"],
+    "hypotheses": ["并行度不足是可能原因之一，需要额外证据。"],
+    "data_gaps": ["没有同任务不同 CPU 配置的对照实验。"],
+    "recommendations": ["在授权条件下用相同输入比较不同 CPU 配置，检查输出一致性和运行时长。"]
+  },
+  "error": null
+}
