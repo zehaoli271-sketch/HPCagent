@@ -18,9 +18,9 @@
 
 ## 指标口径
 
-- 按工作人员回复：作业 CPU 时间累计有效步骤 `time.total`；排除 `extern`，`batch` 仅含脚本自身。普通步骤零值原因待核实，不能直接判定低效。重启、重新排队和统计遗漏需单独验证。
-- `elapsed` 包含挂起；有效运行时间为 `elapsed - suspended`，`start=4294967294` 表示从未开始。资源变化时不能直接使用固定 CPU 数公式。
-- 步骤级 `tres.requested.max` 中 `type=mem` 是单任务 MaxRSS，单位字节，不等同于作业总内存峰值。内存分配字段单位及换算细节见 `docs/数据口径.md`。
+- 按工作人员回复，作业 CPU 时间累计有效步骤 `time.total`，排除 `extern`，`batch` 仅含脚本自身。`time.total` 在步骤结束后写入。运行中的步骤尚未记账，已结束步骤的零值仍需复核。重启、重新排队和统计遗漏需单独验证。
+- 有效运行时间为 `end - start - suspended`。用 `elapsed` 校验起止差或有效运行时间。 `start=4294967294` 表示从未开始。资源变化时不能直接使用固定 CPU 数公式。
+- 步骤级 `tres.requested.max` 中 `type=mem` 是单任务 MaxRSS。`seff` 估算取各步骤 `tres.requested.total[mem]` 的最大值。作业并发峰值使用另行核实的监控证据。单位及换算见 `docs/数据口径.md`。
 - 报告区分已确认事实、推测与未知；低利用率不等于可回收资源，也不能单凭它定位瓶颈。数值由可测试的确定性工具计算，不让大模型编造。
 - `experiments/step_cpu_efficiency.py` 是旧口径原型，不适用于正式诊断；实现正式指标前先核对文档和样本。
 
