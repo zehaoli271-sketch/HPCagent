@@ -8,8 +8,11 @@ import unittest
 from unittest.mock import Mock
 
 from agent.chat import ChatState, ConversationRun
-from core.job_monitor import CgroupMonitor, PrometheusRateLimit, combine_cpu_series, combine_memory_series, expand_hostlist
-from core.live_collection import LiveCollector, allocation_from_job
+from core.job_monitor import (
+    CgroupMonitor, PrometheusRateLimit, combine_cpu_series, combine_memory_series, expand_hostlist,
+    measure_cpu_series, measure_memory_series,
+)
+from core.live_collection import CollectionConflict, LiveCollector, allocation_from_job
 from core.slurm_jobs import SlurmJobsError
 from frontend.demo import demo_cgroup_response
 from frontend.server import DataSource, DemoDataSource, create_server
@@ -62,6 +65,37 @@ class LiveCollectionTest(unittest.TestCase):
         self.assertIsNone(combine_cpu_series(JOB_NODE_PAIR, {"demo01": samples["demo01"]}, start, end))
         self.assertIsNone(combine_cpu_series(JOB_NODE_PAIR, {**samples, "demo02": [(start, 200), (end, 50)]}, start, end))
         self.assertIsNone(combine_memory_series(JOB_NODE_PAIR, {**samples, "demo02": [(end - 90, 200)]}, start, end))
+
+    def test_four_node_memory_alignment_accepts_samples_on_either_side_of_earliest_latest_sample(self):
+        nodes = ("demo01", "demo02", "demo03", "demo04")
+        samples = {
+            node: [(STAMP - 300 + offset, 80), (STAMP - 80 + offset, 100 + index)]
+            for index, (node, offset) in enumerate(zip(nodes, (0, 7, 17, 24)))
+        }
+        result, reason = measure_memory_series(nodes, samples, STAMP - 900, STAMP, max_sample_age=360)
+        self.assertIsNone(reason)
+        self.assertEqual(result["memory_used_bytes"], 406)
+        self.assertEqual(result["memory_observed_at"], STAMP - 56)
+        self.assertEqual(result["memory_max_skew_seconds"], 24)
+
+    def test_memory_alignment_can_use_prior_complete_sample_group_while_it_is_fresh(self):
+        samples = {"demo01": [(STAMP - 320, 100), (STAMP - 20, 300)], "demo02": [(STAMP - 310, 200)]}
+        result, reason = measure_memory_series(JOB_NODE_PAIR, samples, STAMP - 900, STAMP, max_sample_age=360)
+        self.assertIsNone(reason)
+        self.assertEqual(result["memory_used_bytes"], 300)
+        self.assertEqual(result["memory_observed_at"], STAMP - 310)
+
+    def test_missing_memory_sample_outcomes_are_reported_separately(self):
+        cases = [
+            ({"demo01": [(STAMP - 20, 100)]}, "1 个返回了有效内存样本"),
+            ({"demo01": [(STAMP - 20, 100)], "demo02": [(STAMP - 400, 200)]}, "样本已过期"),
+            ({"demo01": [(STAMP - 20, 100)], "demo02": [(STAMP - 130, 200)]}, "内存样本相差 110 秒"),
+        ]
+        for samples, expected in cases:
+            with self.subTest(reason=expected):
+                measured, reason = measure_memory_series(JOB_NODE_PAIR, samples, STAMP - 900, STAMP, max_sample_age=360)
+                self.assertIsNone(measured)
+                self.assertIn(expected, reason)
 
     def test_worker_calculates_snapshot_updates_deduplicates_and_invalidates_stale_auth(self):
         time = Mock(return_value=STAMP)
@@ -302,12 +336,20 @@ class LiveCollectionTest(unittest.TestCase):
                     self.assertEqual(response.readline(), b"\n")
                     sweep.start()
                     self.assertTrue(blocked.wait(3))
-                    self.assertEqual(collector.snapshot()["status"], "warming_up")
-                    self.assertEqual(collector.snapshot()["collection_revision"], 0)
+                    jobs.append({"job_id": 10008, "job_state": ["RUNNING"]})
+                    collector.refresh_catalog()
+                    initial = collector.snapshot()
+                    self.assertEqual(initial["status"], "warming_up")
+                    self.assertEqual(initial["collection_revision"], 0)
+                    self.assertTrue(initial["catalog_only"])
+                    self.assertEqual([row["id"] for row in initial["jobs"]], ["10006", "10007"])
+                    self.assertTrue(all(row["efficiency"] is None and row["memory_ratio"] is None for row in initial["jobs"]))
                     release.set()
                     self.assertEqual(response.readline(), b"data: 1\n")
                     snapshot = collector.snapshot()
                     self.assertEqual(snapshot["collection_revision"], 1)
+                    self.assertFalse(snapshot.get("catalog_only", False))
+                    self.assertEqual([row["id"] for row in snapshot["jobs"]], ["10006", "10007", "10008"])
                     self.assertEqual(snapshot["coverage"]["nodes_attempted"], 10)
                     self.assertEqual(snapshot["coverage"]["nodes_visited"], 10)
                     self.assertEqual(limited, 0)
@@ -336,6 +378,48 @@ class LiveCollectionTest(unittest.TestCase):
         detail = ConversationRun(ChatState(), source, None).run("查询当前作业 ID 为10006 的 CPU 效率")
         self.assertEqual(detail["live_detail"]["efficiency"], 0.25)
 
+    def test_pause_interrupts_waiting_sweep_and_preserves_last_published_snapshot(self):
+        waiting = Event()
+        source = DemoDataSource()
+        source.enable_collection(PrometheusRateLimit(30), 30, full_pass=True)
+        collector = source.collector
+        collector.clock = lambda: STAMP
+        collector.catalog = lambda: {"jobs": [JOB]}
+        collector.prometheus = lambda _path, params, **_: demo_cgroup_response(params)
+        collector.refresh_catalog()
+        previous = collector.collect_once()
+
+        def rate_limited(*_args, **_kwargs):
+            waiting.set()
+            error = SlurmJobsError("monitor_budget", "模拟等待监控额度")
+            error.retry_after = 120
+            raise error
+
+        normal = collector.prometheus
+        collector.prometheus = Mock(side_effect=rate_limited)
+        sweep = Thread(target=collector.collect_once, daemon=True)
+        try:
+            sweep.start()
+            self.assertTrue(waiting.wait(3))
+            self.assertFalse(collector.set_collection_enabled(False))
+            paused = collector.snapshot()
+            self.assertTrue(paused["collection_paused"])
+            self.assertFalse(paused["updates_on_completion"])
+            self.assertEqual(paused["jobs"], previous["jobs"])
+            self.assertTrue(collector.set_collection_enabled(True))
+            sweep.join(3)
+            self.assertFalse(sweep.is_alive())
+            self.assertEqual(collector.snapshot()["collection_revision"], 1)
+            collector.prometheus.assert_called_once()
+            self.assertIsNone(collector.collect_once())
+            collector.prometheus = normal
+            collector.refresh_catalog()
+            self.assertIsNotNone(collector.collect_once())
+            self.assertEqual(collector.snapshot()["collection_revision"], 2)
+        finally:
+            collector.stop()
+            sweep.join(3)
+
     def test_live_query_keeps_high_usage_when_requesting_specific_job(self):
         source = DemoDataSource()
         source.demo_started = STAMP - 1000
@@ -343,9 +427,122 @@ class LiveCollectionTest(unittest.TestCase):
         source.collector.clock = lambda: STAMP
         source.collector.refresh_catalog()
         source.collector.collect_once()
-        report = ConversationRun(ChatState(), source, None).run("查询当前作业 ID 为10006 的 CPU 效率")
+        report = ConversationRun(ChatState(), source, None).run("查询10006的当前效率")
         self.assertEqual(report["live_detail"]["job_id"], 10006)
         self.assertEqual(report["live_detail"]["efficiency"], 0.25)
+        self.assertEqual(report["monitor_job"]["job_id"], 10006)
+
+    def test_single_job_reads_only_its_nodes_and_measures_new_sample_timestamps(self):
+        now = STAMP - 90
+        source = DataSource(None, None, None, token="fixture-token")
+        source.enable_collection(PrometheusRateLimit(30), 30, full_pass=True)
+        collector = source.collector
+        collector.clock = lambda: now
+        collector.catalog = Mock(return_value={"jobs": [JOB, {**JOB, "job_id": 10007, "nodes": "other01"}]})
+        collector.refresh_catalog()
+        collector.prometheus = Mock(side_effect=lambda _path, params, **_: demo_cgroup_response(params))
+        now = STAMP
+        with self.assertRaises(CollectionConflict):
+            collector.sample_job(10006)
+        collector.prometheus.assert_not_called()
+        collector.set_collection_enabled(False)
+
+        first = collector.sample_job(10006)
+        self.assertEqual(first["job"]["efficiency"], 0.25)
+        self.assertEqual(first["job"]["memory_ratio"], 0.25)
+        self.assertEqual(first["next_poll_seconds"], 15)
+        query = collector.prometheus.call_args.args[1]["query"]
+        self.assertIn('/slurm/uid_[0-9]+/job_10006', query)
+        self.assertIn('hostname="demo01"', query)
+        self.assertIn('hostname="demo02"', query)
+        self.assertNotIn("other01", query)
+        self.assertEqual(collector.snapshot()["collection_revision"], 0)
+
+        now += 15
+        second = collector.sample_job(10006, JOB["start_time"]["number"])
+        self.assertGreater(second["job"]["cpu_observed_end"], first["job"]["cpu_observed_end"])
+        self.assertGreater(second["job"]["memory_observed_at"], first["job"]["memory_observed_at"])
+        self.assertEqual(collector.sample_job(10006, JOB["start_time"]["number"] + 1)["status"], "ended")
+
+    def test_single_node_accepts_fractional_samples_five_minutes_apart(self):
+        source = DataSource(None, None, None, token="fixture-token")
+        source.enable_collection(PrometheusRateLimit(30), 30, full_pass=True)
+        collector = source.collector
+        collector.clock = lambda: STAMP
+        collector.catalog = lambda: {"jobs": [
+            {**JOB, "nodes": "demo01", "tres_alloc_str": "cpu=4,mem=8G", "resize_time": 0},
+        ]}
+        collector.refresh_catalog()
+        collector.set_collection_enabled(False)
+        first, last = STAMP - 433.666, STAMP - 133.666
+
+        def read(path, params, *, timeout):
+            self.assertEqual(path, "/prometheus/query")
+            self.assertTrue(params["query"].endswith("[901s]"))
+            self.assertIn('hostname="demo01"', params["query"])
+            self.assertIn('job_10006', params["query"])
+            values = ((1000, 1300) if params["query"].startswith("cgroup_cpu_total_seconds")
+                      else (2 * 1024 ** 3, 2 * 1024 ** 3))
+            return {"status": "success", "data": {"resultType": "matrix", "result": [
+                {"metric": {"hostname": "demo01", "cgroup": PATH}, "values": list(zip((first, last), values))},
+            ]}}
+
+        collector.prometheus = Mock(side_effect=read)
+        sample = collector.sample_job(10006)
+        self.assertEqual(sample["job"]["efficiency"], 0.25)
+        self.assertEqual(sample["job"]["memory_ratio"], 0.25)
+        self.assertEqual(sample["job"]["cpu_seconds"], 300)
+        self.assertEqual(datetime.fromisoformat(sample["job"]["cpu_observed_end"]).timestamp(), last)
+        self.assertEqual(sample["max_sample_age_seconds"], 360)
+        self.assertEqual(collector.prometheus.call_count, 2)
+
+    def test_cpu_sample_failures_distinguish_missing_points_stale_and_counter_reset(self):
+        cases = [
+            ([(STAMP - 150, 3)], "两个 CPU 采样点"),
+            ([(STAMP - 60, 3), (STAMP - 30, 4)], "共同 CPU 采样区间过短"),
+            ([(STAMP - 700, 3), (STAMP - 400, 4)], "样本已过期"),
+            ([(STAMP - 500, 4), (STAMP - 200, 3)], "累计计数发生回退"),
+        ]
+        for points, expected in cases:
+            with self.subTest(reason=expected):
+                measured, reason = measure_cpu_series(("demo01",), {"demo01": points}, STAMP - 900, STAMP,
+                                                      minimum_seconds=60, max_sample_age=360, recent_seconds=300)
+                self.assertIsNone(measured)
+                self.assertIn(expected, reason)
+
+    def test_pager_reads_original_result_after_a_later_question_without_upstream_calls(self):
+        source = DemoDataSource()
+        source.enable_collection(PrometheusRateLimit(30), 30, full_pass=True)
+        source.collector.catalog = lambda: {"jobs": [{**JOB, "job_id": 10006 + index} for index in range(41)]}
+        source.collector.clock = lambda: STAMP
+        source.collector.refresh_catalog()
+        source.get_json = Mock(side_effect=AssertionError("pagination must not query upstream"))
+        with create_server(source, 0) as server:
+            worker = Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with closing(HTTPConnection("127.0.0.1", server.server_port, timeout=5)) as browser:
+                    def post(path, body):
+                        browser.request("POST", path, json.dumps(body), {"Content-Type": "application/json"})
+                        response = browser.getresponse()
+                        return response.status, response.read()
+
+                    chat = {"chat_id": "a" * 32, "question": "查询当前所有正在运行的作业"}
+                    status, data = post("/api/v1/chat", chat)
+                    self.assertEqual(status, 200)
+                    result = next(event["data"] for event in map(json.loads, data.splitlines()) if event["type"] == "result")
+                    self.assertEqual(result["pages"], 3)
+                    self.assertEqual(result["records"][0]["job_id"], 10006)
+                    post("/api/v1/chat", {**chat, "question": "查询10006的当前效率"})
+                    page = {"chat_id": chat["chat_id"], "page_id": result["page_id"], "page": 2}
+                    status, data = post("/api/v1/chat-page", page)
+                    self.assertEqual(status, 200)
+                    self.assertEqual(json.loads(data)["offset"], 20)
+                    self.assertEqual(json.loads(data)["records"][0]["job_id"], 10026)
+                    self.assertEqual(post("/api/v1/chat-page", {**page, "chat_id": "b" * 32})[0], 404)
+            finally:
+                server.shutdown()
+                worker.join()
 
     def test_browser_connection_starts_and_stops_a_session_collector(self):
         demo = DemoDataSource()
@@ -363,8 +560,8 @@ class LiveCollectionTest(unittest.TestCase):
         connected.collector.clock = lambda: STAMP
         original_collect = connected.collector.collect_once
 
-        def notify():
-            original_collect()
+        def notify(cancelled):
+            original_collect(cancelled)
             published.set()
 
         connected.collector.collect_once = notify
@@ -395,3 +592,143 @@ class LiveCollectionTest(unittest.TestCase):
             finally:
                 server.shutdown()
                 worker.join()
+
+    def test_default_collection_reports_conflicts_and_interruption_allows_query(self):
+        demo = DemoDataSource()
+        connected = DataSource(None, None, None, token="fixture-token")
+        connected.enable_collection(PrometheusRateLimit(30), 30, full_pass=True)
+        connected.collector.clock = lambda: STAMP
+        jobs = [JOB, {"job_id": 10008, "job_state": ["RUNNING"]}, {"job_id": 10009, "job_state": ["PENDING"]}]
+        entered, release = Event(), Event()
+
+        def read(path, params=None, **opts):
+            if path == "/slurm/jobs":
+                return {"jobs": jobs}
+            if path.startswith("/prometheus/"):
+                entered.set()
+                if not release.wait(8):
+                    raise AssertionError("test did not release the active collection")
+            return demo.get_json(path, params, **opts)
+
+        connected.get_json = Mock(side_effect=read)
+        with create_server(DataSource(None, None, None), 0, connection_factory=lambda _: connected) as server:
+            worker = Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            try:
+                with closing(HTTPConnection("127.0.0.1", server.server_port, timeout=5)) as browser:
+                    def request(method, path, body=None, headers=None):
+                        browser.request(method, path, json.dumps(body) if body is not None else None, headers or {})
+                        response = browser.getresponse()
+                        return response, response.read()
+
+                    headers = {"Content-Type": "application/json"}
+                    response, data = request("POST", "/api/v1/hpc-connection", {"token": "fixture-token"}, headers)
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(json.loads(data)["collection_enabled"])
+                    self.assertTrue(entered.wait(3))
+                    authenticated = {**headers, "Cookie": response.getheader("Set-Cookie").split(";", 1)[0]}
+                    toggle = "/api/v1/live-collection"
+                    heatmap = "/api/v1/job-heatmap?view=running"
+                    self.assertEqual(request("POST", toggle, {"enabled": True}, headers)[0].status, 409)
+                    self.assertEqual(request("POST", toggle, {"enabled": "yes"}, authenticated)[0].status, 400)
+                    self.assertEqual(request("POST", toggle, {"enabled": True}, {
+                        **authenticated, "Origin": "https://example.com",
+                    })[0].status, 403)
+                    initial = json.loads(request("GET", heatmap, headers=authenticated)[1])
+                    self.assertEqual(initial["status"], "warming_up")
+                    self.assertTrue(initial["catalog_only"])
+                    self.assertEqual([row["id"] for row in initial["jobs"]], ["10006", "10008"])
+                    self.assertIsNone(initial["jobs"][0]["efficiency"])
+                    self.assertIsNone(initial["jobs"][0]["memory_ratio"])
+                    response, data = request("POST", "/api/v1/chat", {
+                        "chat_id": "a" * 32, "question": "查询当前作业 ID 为 10006 的 CPU 效率",
+                    }, authenticated)
+                    self.assertEqual(response.status, 200)
+                    report = next(event["data"] for event in map(json.loads, data.splitlines()) if event["type"] == "result")
+                    self.assertEqual(report["source"], "Slurm")
+                    self.assertEqual(report["live_detail"]["job_id"], 10006)
+                    self.assertIsNone(report["live_detail"]["efficiency"])
+                    response, data = request("POST", "/api/v1/chat", {
+                        "chat_id": "a" * 32, "question": "查询当前 CPU 利用率低于 30% 的作业",
+                    }, authenticated)
+                    self.assertEqual(response.status, 200)
+                    report = next(event["data"] for event in map(json.loads, data.splitlines()) if event["type"] == "result")
+                    self.assertEqual(report["records"], [])
+                    question = {"chat_id": "a" * 32, "question": "分析作业 10001"}
+                    response, data = request("POST", "/api/v1/chat", question, authenticated)
+                    self.assertEqual(response.status, 200)
+                    report = next(event["data"] for event in map(json.loads, data.splitlines()) if event["type"] == "result")
+                    self.assertEqual(report["status"], "collection_conflict")
+                    response, data = request("POST", "/api/v1/job-detail", {
+                        "chat_id": "a" * 32, "job_id": "10001",
+                    }, authenticated)
+                    self.assertEqual(response.status, 409)
+                    self.assertEqual(json.loads(data)["status"], "collection_conflict")
+                    self.assertTrue(connected.collector.collection_enabled)
+                    self.assertFalse(any(call.args[0].startswith("/slurmdb/") for call in connected.get_json.call_args_list))
+                    live_job = {"job_id": "10006", "started_at": JOB["start_time"]["number"]}
+                    self.assertEqual(request("POST", "/api/v1/live-job", live_job, authenticated)[0].status, 409)
+
+                    response, data = request("POST", toggle, {"enabled": False}, authenticated)
+                    self.assertEqual(response.status, 200)
+                    self.assertIsNone(response.getheader("Set-Cookie"))
+                    self.assertEqual(json.loads(data), {"source_kind": "hpc_api", "connected": True,
+                                                        "collection_enabled": False})
+                    response, data = request("POST", "/api/v1/live-job", live_job, authenticated)
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.loads(data)["status"], "waiting")
+                    self.assertEqual(request("GET", "/api/v1/job-heatmap?view=completed", headers=authenticated)[0].status, 200)
+                    response, data = request("POST", "/api/v1/chat", question, authenticated)
+                    self.assertEqual(response.status, 200)
+                    report = next(event["data"] for event in map(json.loads, data.splitlines()) if event["type"] == "result")
+                    self.assertEqual(report["details"][0]["job_id"], 10001)
+                    self.assertEqual([call.args[0] for call in connected.get_json.call_args_list
+                                      if call.args[0].startswith("/slurmdb/")], ["/slurmdb/jobs", "/slurmdb/job/10001"])
+                    self.assertEqual(connected.collector.snapshot()["collection_revision"], 0)
+
+                    release.set()
+                    response, data = request("POST", toggle, {"enabled": True}, authenticated)
+                    self.assertEqual(response.status, 200)
+                    self.assertTrue(json.loads(data)["collection_enabled"])
+                    self.assertEqual(connected.collector.wait_for_snapshot(0, timeout=3), 1)
+                    response, data = request("POST", toggle, {"enabled": False}, authenticated)
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(json.loads(data), {"source_kind": "hpc_api", "connected": True,
+                                                        "collection_enabled": False})
+                    self.assertIsNone(response.getheader("Set-Cookie"))
+                    paused = json.loads(request("GET", heatmap, headers=authenticated)[1])
+                    self.assertTrue(paused["collection_paused"])
+                    self.assertEqual(paused["jobs"][0]["job_id"], JOB["job_id"])
+                    self.assertEqual(request("GET", "/api/v1/live-updates", headers=authenticated)[0].status, 204)
+            finally:
+                release.set()
+                server.shutdown()
+                worker.join()
+
+    def test_startup_token_shows_initial_directory_while_collection_runs(self):
+        source = DataSource(None, None, None, token="fixture-token")
+        entered, release = Event(), Event()
+
+        def read(path, params=None, **_):
+            if path == "/slurm/jobs":
+                return {"jobs": [JOB]}
+            entered.set()
+            if not release.wait(5):
+                raise AssertionError("test did not release the active collection")
+            return demo_cgroup_response(params)
+
+        source.get_json = Mock(side_effect=read)
+        source.enable_collection(PrometheusRateLimit(30), 30, full_pass=True)
+        collector = source.collector
+        collector.clock = lambda: STAMP
+        source.start_collection()
+        try:
+            self.assertTrue(entered.wait(3))
+            snapshot = collector.snapshot()
+            self.assertTrue(snapshot["catalog_only"])
+            self.assertFalse(snapshot["collection_paused"])
+            self.assertEqual(snapshot["jobs"][0]["job_id"], JOB["job_id"])
+            self.assertEqual(source.get_json.call_args_list[0].args[0], "/slurm/jobs")
+        finally:
+            source.stop_collection()
+            release.set()

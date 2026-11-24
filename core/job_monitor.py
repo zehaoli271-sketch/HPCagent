@@ -5,7 +5,7 @@ from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import json
-from math import isfinite
+from math import ceil, isfinite
 import re
 from threading import Lock
 from time import monotonic
@@ -152,16 +152,17 @@ def read_job_cpu_counter(request, hostname, path, start, end):
     return points
 
 
-def _live_selector(metric, hostname):
-    return f'{metric}{{hostname={json.dumps(hostname)},cgroup=~"{ROOT_SELECTOR}"}}'
+def _live_selector(metric, hostname, job_id=None):
+    root = ROOT_SELECTOR if job_id is None else f"{ROOT_PREFIX}{job_id}"
+    return f'{metric}{{hostname={json.dumps(hostname)},cgroup=~"{root}"}}'
 
 
-def _live_range_series(request, hosts, start, end):
+def _live_range_series(request, hosts, start, end, job_id=None):
     # query_range labels points with evaluation times. Read the scrape timestamps
     # alongside the values so repeated evaluations cannot pass as fresh samples.
     terms = []
     for metric, resource in RESOURCE_BY_METRIC.items():
-        selectors = [_live_selector(metric, hostname) for hostname in hosts]
+        selectors = [_live_selector(metric, hostname, job_id) for hostname in hosts]
         values = " or ".join(selectors)
         timestamps = " or ".join(f"timestamp({selector})" for selector in selectors)
         terms.extend((f'label_replace(({values}),"hpc_sample","{resource}","hostname",".+")',
@@ -223,32 +224,65 @@ def _value_at(points, timestamp, *, interpolate=False):
     return value
 
 
-def combine_cpu_series(hosts, per_node, start, end, *, minimum_seconds=None, max_sample_age=SAMPLE_MAX_AGE):
-    series = [_points(per_node.get(node), start, end, counter=True) for node in hosts]
+def measure_cpu_series(hosts, per_node, start, end, *, minimum_seconds=None, max_sample_age=SAMPLE_MAX_AGE,
+                       recent_seconds=None):
+    series = [_points(per_node.get(node), start, end, counter=False) for node in hosts]
     if not series or any(len(line) < 2 for line in series):
-        return None
-    left = max(line[0][0] for line in series)
+        return None, "至少有一个分配节点在可核实的运行区间内尚未取得两个 CPU 采样点。"
+    if any(right[1] < left[1] for line in series for left, right in zip(line, line[1:])):
+        return None, "CPU 累计计数发生回退，当前采样区间待核实。"
     right = min(line[-1][0] for line in series)
+    left = max(line[0][0] for line in series)
+    if recent_seconds is not None:
+        left = max(left, right - recent_seconds)
     required = (end - start) * MIN_WINDOW_COVERAGE if minimum_seconds is None else minimum_seconds
-    if right <= left or right - left < required or end - right > max_sample_age:
-        return None
+    if right <= left or right - left < required:
+        return None, "各分配节点的共同 CPU 采样区间过短。"
+    if end - right > max_sample_age:
+        return None, "最近一次覆盖全部节点的 CPU 样本已过期。"
     used = sum(_value_at(line, right, interpolate=True) - _value_at(line, left, interpolate=True)
                for line in series)
-    return [(left, 0.0), (right, used)]
+    return [(left, 0.0), (right, used)], None
+
+
+def combine_cpu_series(hosts, per_node, start, end, *, minimum_seconds=None, max_sample_age=SAMPLE_MAX_AGE):
+    series, _ = measure_cpu_series(hosts, per_node, start, end, minimum_seconds=minimum_seconds,
+                                   max_sample_age=max_sample_age)
+    return series
+
+
+def measure_memory_series(hosts, per_node, start, end, *, max_sample_age=SAMPLE_MAX_AGE):
+    series = [_points(per_node.get(node), start, end, counter=False) for node in hosts]
+    covered = sum(bool(line) for line in series)
+    if not series or covered != len(series):
+        return None, f"{len(series)} 个分配节点中，{covered} 个返回了有效内存样本。"
+    earliest = end - max_sample_age
+    latest_by_node = [line[-1][0] for line in series]
+    if min(latest_by_node) < earliest:
+        return None, "部分分配节点的最新内存样本已过期。"
+
+    # Work backwards from the latest possible end of a complete group.
+    latest = min(end, min(latest_by_node) + MEMORY_MAX_SKEW)
+    while latest >= earliest:
+        indexes = [bisect_right(line, (latest, float("inf"))) - 1 for line in series]
+        if min(indexes) < 0:
+            break
+        aligned = [line[index] for line, index in zip(series, indexes)]
+        first = min(stamp for stamp, _ in aligned)
+        last = max(stamp for stamp, _ in aligned)
+        if first < earliest:
+            break
+        if last - first <= MEMORY_MAX_SKEW:
+            return {"memory_used_bytes": int(sum(value for _, value in aligned)),
+                    "memory_observed_at": last, "memory_max_skew_seconds": last - first}, None
+        latest = first + MEMORY_MAX_SKEW
+    gap = ceil(max(latest_by_node) - min(latest_by_node))
+    return None, f"节点最新内存样本相差 {gap} 秒，未找到时间差在 {MEMORY_MAX_SKEW} 秒内的一组样本。"
 
 
 def combine_memory_series(hosts, per_node, start, end, *, max_sample_age=SAMPLE_MAX_AGE):
-    series = [_points(per_node.get(node), start, end, counter=False) for node in hosts]
-    if not series or not all(series):
-        return None
-    at = min(line[-1][0] for line in series)
-    if end - at > max_sample_age:
-        return None
-    aligned = [bisect_right(line, (at, float("inf"))) - 1 for line in series]
-    if any(index < 0 or at - line[index][0] > MEMORY_MAX_SKEW for line, index in zip(series, aligned)):
-        return None
-    return {"memory_used_bytes": int(sum(line[index][1] for line, index in zip(series, aligned))),
-            "memory_observed_at": at, "memory_max_skew_seconds": max(at - line[index][0] for line, index in zip(series, aligned))}
+    memory, _ = measure_memory_series(hosts, per_node, start, end, max_sample_age=max_sample_age)
+    return memory
 
 
 def fresh_series(raw, end):
@@ -262,7 +296,7 @@ class CgroupMonitor:
     def __init__(self):
         self.live_batch_nodes = LIVE_BATCH_NODES
 
-    def collect_sweep(self, request, jobs, *, width, clock, priority=None):
+    def collect_sweep(self, request, jobs, *, width, clock, cancelled, priority=None):
         """Read each assigned node once, with the shared rate limiter on every request."""
         by_host = defaultdict(list)
         for job_id, hosts in jobs.items():
@@ -279,6 +313,8 @@ class CgroupMonitor:
             groups.append(by_job)
 
         def read(group):
+            if cancelled.is_set():
+                return None
             end = int(clock())
             return CgroupMonitor().collect_live(request, group, end - width, end)
 
@@ -286,7 +322,10 @@ class CgroupMonitor:
         coverage = {"nodes_total": len(hosts), "nodes_visited": 0, "nodes_attempted": 0,
                     "errors": {}, "monitor_mode": "bounded_sweep"}
         with ThreadPoolExecutor(max_workers=3, thread_name_prefix="hpc-monitor") as workers:
-            for chunk, result in workers.map(read, groups):
+            for batch in workers.map(read, groups):
+                if cancelled.is_set():
+                    break
+                chunk, result = batch
                 coverage["nodes_visited"] += result["nodes_visited"]
                 coverage["nodes_attempted"] += result["nodes_attempted"]
                 coverage["errors"].update(result["errors"])
@@ -295,7 +334,7 @@ class CgroupMonitor:
                         samples[metric][job_id].update(lines)
         return samples, coverage
 
-    def collect_live(self, request, jobs, start, end, *, node_offset=0, priority=None):
+    def collect_live(self, request, jobs, start, end, *, node_offset=0, priority=None, only_job_id=None, raw=False):
         by_node = defaultdict(set)
         for job_id, hosts in jobs.items():
             for host in hosts:
@@ -326,10 +365,10 @@ class CgroupMonitor:
                         samples[resource][job_id][host] = points
 
         while index < len(nodes):
-            if self.live_batch_nodes:
+            if self.live_batch_nodes and not raw:
                 batch = nodes[index:index + self.live_batch_nodes]
                 try:
-                    store(_live_range_series(request, batch, start, end))
+                    store(_live_range_series(request, batch, start, end, only_job_id))
                 except SlurmJobsError as error:
                     if error.code == "prometheus_query_too_long" and self.live_batch_nodes > 1:
                         self.live_batch_nodes //= 2
@@ -353,7 +392,7 @@ class CgroupMonitor:
             for metric, resource in RESOURCE_BY_METRIC.items():
                 try:
                     payload = request("/prometheus/query", {
-                        "query": f"{_live_selector(metric, hostname)}[{end - start + 1}s]", "time": end,
+                        "query": f"{_live_selector(metric, hostname, only_job_id)}[{end - start + 1}s]", "time": end,
                     })
                     store((resource, tags, values) for tags, values in _series(payload, "matrix")
                           if tags.get("hostname") == hostname)
@@ -372,7 +411,7 @@ class CgroupMonitor:
         return samples, {
             "nodes_total": len(nodes), "nodes_visited": len(visited["cpu"] | visited["memory"]),
             "nodes_attempted": index, "visited_hosts": visited, "errors": errors,
-            "monitor_mode": "batched_range" if self.live_batch_nodes else "node_range",
+            "monitor_mode": "batched_range" if self.live_batch_nodes and not raw else "node_range",
         }
 
     def collect(self, request, jobs, start, end, *, memory=True, node_offset=0, priority=None):

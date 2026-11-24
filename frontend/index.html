@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>作业资源观察 · HPC Guardian</title><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="diagnoses.css"></head>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>作业资源观察 · HPC Guardian</title><link rel="stylesheet" href="style.css"><link rel="stylesheet" href="diagnoses.css?v=sample-tooltip"></head>
 <body><div class="shell">
 <header class="topbar">
   <div class="brand"><span class="brand-mark">▦</span><span>HPC <b>GUARDIAN</b></span><span class="brand-divider"></span><span class="brand-sub">资源观察</span></div>
@@ -7,7 +7,12 @@
     <button id="show-dashboard" type="button" aria-pressed="true" aria-controls="home-view">展示</button>
     <button id="show-conversation" type="button" aria-pressed="false" aria-controls="diagnosis-view">对话</button>
   </nav>
-  <div class="header-right"><span class="live-dot"></span><span id="source-label">等待数据</span><button id="hpc-connect-button" class="hpc-connect-button" type="button">连接 SJTU HPC</button></div>
+  <div class="header-right">
+    <span class="live-dot"></span><span id="source-label">等待数据</span>
+    <button id="hpc-collection-enabled" class="hpc-connect-button" type="button" hidden>中断后台采集</button>
+    <button id="hpc-connect-button" class="hpc-connect-button" type="button">连接 SJTU HPC</button>
+    <span id="hpc-collection-status" class="collection-status" role="status" hidden></span>
+  </div>
 </header>
 <div id="home-view">
 <main><div class="intro"><div><div class="eyebrow">CLUSTER OBSERVATORY <span> / </span> JOBS</div><h1 id="home-title" tabindex="-1">作业资源观察</h1><p>查看集群作业的 CPU 和内存使用情况。</p></div><div class="intro-side"><span>数据来源</span><strong id="source-kind">等待数据</strong></div></div>
@@ -41,7 +46,7 @@
 </div>
 <div id="notice" class="notice" role="status">正在连接数据源…</div><div class="plot-head"><span id="plot-count">作业列表</span><span>选择方格查看详情</span></div><div id="grid" class="grid" aria-label="作业效率方格图"></div><div class="plot-footer"><div class="legend"><span>低效率</span><i class="level-0"></i><i class="level-1"></i><i class="level-2"></i><i class="level-3"></i><i class="level-4"></i><span>高效率</span><span class="legend-gap"></span><i class="unknown"></i><span>暂无可信效率</span></div></div></section>
 <div class="footnote"><span>●</span><span id="metric-footnote">运行中作业使用实测时间窗内的 CPU 用量。已完成作业使用整段运行的 CPU 记账数据。</span></div></main>
-<aside id="drawer" class="drawer" aria-labelledby="detail-title" hidden><div class="drawer-header"><div><div class="section-kicker">JOB DETAILS</div><h2 id="detail-title">作业详情</h2></div><button id="close" aria-label="关闭详情">×</button></div><div id="details"></div></aside>
+<aside id="drawer" class="drawer" aria-labelledby="detail-title" hidden><div class="drawer-header"><div><div class="section-kicker">JOB DETAILS</div><h2 id="detail-title">作业详情</h2></div><button id="close" aria-label="关闭详情">×</button></div><div id="drawer-live-job"></div><div id="details"></div></aside>
 </div>
 <main id="diagnosis-view" hidden>
   <section id="diagnostics" class="panel diagnosis-panel" aria-labelledby="diagnosis-title">
@@ -74,7 +79,7 @@
 </dialog>
 <dialog id="hpc-connect-dialog" class="hpc-connect-dialog" aria-labelledby="hpc-connect-title">
   <h2 id="hpc-connect-title">连接 SJTU HPC</h2>
-  <p>输入有权读取作业的访问令牌。连接成功后，当前作业视图会每 10 秒刷新。</p>
+  <p>输入有权读取作业的访问令牌。连接后会自动采集正在运行的作业。</p>
   <form id="hpc-connect-form" method="dialog">
     <label for="hpc-token">SJTU HPC 访问令牌</label>
     <input id="hpc-token" type="password" autocomplete="off" spellcheck="false" maxlength="4096" required placeholder="Bearer Token">
@@ -86,4 +91,12 @@
     </div>
   </form>
 </dialog>
-<footer><span>HPC GUARDIAN</span><span>上海交通大学 · 超算作业资源观察</span></footer></div><script src="app.js"></script><script src="diagnoses.js"></script><script src="hpc-connection.js"></script></body></html>
+<dialog id="collection-conflict-dialog" class="hpc-connect-dialog" aria-labelledby="collection-conflict-title">
+  <h2 id="collection-conflict-title">中断后台采集？</h2>
+  <p id="collection-conflict-description">这次查询需要使用 HPC 接口。中断采集后会继续查询，并保留最近一次已发布的结果。</p>
+  <form method="dialog" class="hpc-connect-actions">
+    <button id="collection-conflict-cancel" class="refresh" value="cancel" autofocus>取消查询</button>
+    <button id="collection-conflict-accept" class="diagnosis-submit" value="interrupt">中断采集并查询</button>
+  </form>
+</dialog>
+<footer><span>HPC GUARDIAN</span><span>上海交通大学 · 超算作业资源观察</span></footer></div><script src="hpc-connection.js?v=job-monitor"></script><script src="live-job.js?v=sample-tooltip"></script><script src="app.js?v=memory-alignment"></script><script src="diagnoses.js?v=memory-alignment"></script></body></html>

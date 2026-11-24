@@ -1,6 +1,7 @@
 """Local, read-only heatmap and Agent diagnosis service."""
 import argparse
 from datetime import datetime, timezone
+from functools import partial
 from getpass import getpass
 from http.client import HTTPException
 from http.cookies import CookieError, SimpleCookie
@@ -18,12 +19,12 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from agent.chat import ChatState, ConversationRun
+from agent.chat import PAGE_SIZE, ChatState, ConversationRun, public_row
 from agent.web_diagnostics import DEFAULT_SCREENING_MODE, SCREENING_MODES, DiagnosisService, error_response
 from agent.zhiyuan import DEFAULT_MODEL, ZhiyuanModel
 from core.efficiency import allocated_cpu, calculate_job_efficiency
 from core.job_monitor import CPU_METRIC, JobCpuMonitor, PrometheusRateLimit, combine_cpu_series
-from core.live_collection import LiveCollector, allocation_from_job
+from core.live_collection import CollectionConflict, LiveCollector, allocation_from_job
 from core.job_query import JobMemorySchema, SQLiteArchive, accounting_memory, epoch, safe_label, slurm_integer, step_usage, tres_count
 from core.job_screening import DEFAULT_CPU_THRESHOLD
 from core.slurm_jobs import HPC_TOKEN_ENV, SlurmJobsError, parse_slurm_jobs, read_hpc_json
@@ -33,8 +34,12 @@ BASE = "https://api.hpc.sjtu.edu.cn"
 ROOT = Path(__file__).resolve().parent
 NO_VALUE = 4294967294
 CONNECTION_PATH = "/api/v1/hpc-connection"
+COLLECTION_PATH = "/api/v1/live-collection"
+COLLECTION_CONFLICT = {"status": "collection_conflict", "message": "后台采集正在使用 HPC 接口。是否中断采集后继续查询？"}
 CHAT_PATH = "/api/v1/chat"
 JOB_DETAIL_PATH = "/api/v1/job-detail"
+LIVE_JOB_PATH = "/api/v1/live-job"
+CHAT_PAGE_PATH = "/api/v1/chat-page"
 CHAT_ID = re.compile(r"[a-f0-9-]{32,36}")
 SESSION_COOKIE = "hpc_session"
 POLL_SECONDS = 10
@@ -105,8 +110,9 @@ class DataSource:
 
     def enable_collection(self, rate_limit, interval, *, full_pass=False):
         self.prometheus_limit = rate_limit
+        synthetic = self.kind == "synthetic"
         self.collector = LiveCollector(self.running_catalog, self.prometheus_json, interval=interval,
-                                       rpm=rate_limit.rpm, synthetic=self.kind == "synthetic", full_pass=full_pass)
+                                       rpm=rate_limit.rpm, synthetic=synthetic, full_pass=full_pass)
 
     def running_catalog(self):
         payload, self.initial_catalog = self.initial_catalog, None
@@ -119,6 +125,8 @@ class DataSource:
             payload = self.running_catalog()
             if not isinstance(payload.get("jobs"), list):
                 raise SlurmJobsError("hpc_catalog_invalid", "Slurm 当前作业列表格式无效。")
+            if self.collector.full_pass:
+                self.collector.seed_catalog(payload)
             self.initial_catalog = payload
         else:
             self.fetch("running")
@@ -319,9 +327,42 @@ class DemoDataSource(DataSource):
         return chat_demo_jobs(now)
 
 
+class ForegroundSource:
+    """Reserve the query's connection on its first uncached HPC read."""
+
+    def __init__(self, source):
+        self.source = source
+        self.collector = source.collector if source.kind == "hpc_api" else None
+        self.admitted = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        if self.admitted:
+            self.collector.end_foreground_query()
+
+    def __getattr__(self, name):
+        method = getattr(self.source, name)
+        if self.collector and name in {"read_accounting_window", "jobs_at", "job_by_id", "monitor_jobs"}:
+            return partial(self.read, method)
+        return method
+
+    def read(self, method, *args, **kwargs):
+        if not self.admitted:
+            self.collector.begin_foreground_query()
+            self.admitted = True
+        return method(*args, **kwargs)
+
+
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
+
+    def end_headers(self):
+        if self.command in {"GET", "HEAD"} and not urlsplit(self.path).path.startswith("/api/"):
+            self.send_header("Cache-Control", "no-cache")
+        super().end_headers()
 
     def browser_connection(self):
         try:
@@ -338,9 +379,12 @@ class Handler(SimpleHTTPRequestHandler):
         _, connected = self.browser_connection()
         return connected or self.server.source
 
-    def connection_status(self):
-        _, connected = self.browser_connection()
-        return {"source_kind": (connected or self.server.source).kind, "connected": connected is not None}
+    def connection_status(self, connected=None):
+        if connected is None:
+            _, connected = self.browser_connection()
+        source = connected or self.server.source
+        return {"source_kind": source.kind, "connected": connected is not None,
+                "collection_enabled": source.collector.collection_enabled if source.kind == "hpc_api" and source.collector else None}
 
     def same_origin(self):
         origin = self.headers.get("Origin")
@@ -350,8 +394,6 @@ class Handler(SimpleHTTPRequestHandler):
     def connect_hpc(self):
         if not self.same_origin() or self.headers.get_content_type() != "application/json":
             return self.send_json(403, {"error": "请通过本地页面连接 SJTU HPC。"})
-        if self.server.source.kind == "synthetic":
-            return self.send_json(409, {"error": "当前是演示服务。请打开普通 PowerShell 启动的服务网址，再连接 SJTU HPC。"})
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 0 < length <= 8192:
@@ -367,6 +409,8 @@ class Handler(SimpleHTTPRequestHandler):
                 raise ValueError
         except (ValueError, UnicodeError):
             return self.send_json(400, {"error": "请输入有效的 SJTU HPC 访问令牌。"})
+        if self.server.source.kind == "synthetic":
+            return self.send_json(409, {"error": "当前是演示服务。请打开普通 PowerShell 启动的服务网址，再连接 SJTU HPC。"})
 
         source = self.server.connection_factory(token)
         try:
@@ -385,8 +429,28 @@ class Handler(SimpleHTTPRequestHandler):
         if previous:
             previous.stop_collection()
         source.start_collection()
-        self.send_json(200, {"source_kind": source.kind, "connected": True},
+        self.send_json(200, self.connection_status(source),
                        cookie=f"{SESSION_COOKIE}={session_id}; Path=/; HttpOnly; SameSite=Strict")
+
+    def change_live_collection(self):
+        if not self.same_origin() or self.headers.get_content_type() != "application/json":
+            return self.send_json(403, {"error": "请通过本地页面更改后台采集设置。"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 128:
+                raise ValueError
+            payload = json.loads(self.rfile.read(length))
+            if not isinstance(payload, dict) or type(payload.get("enabled")) is not bool:
+                raise ValueError
+        except (ValueError, UnicodeError):
+            return self.send_json(400, {"error": "请选择开启或暂停后台全量采集。"})
+        _, connected = self.browser_connection()
+        source = connected or self.server.source
+        enabled = (source.collector.set_collection_enabled(payload["enabled"])
+                   if source.kind == "hpc_api" and source.collector else None)
+        if enabled is None:
+            return self.send_json(409, {"error": "请先连接可用的 SJTU HPC 数据源。"})
+        return self.send_json(200, self.connection_status(connected))
 
     def do_GET(self):
         url = urlsplit(self.path)
@@ -411,7 +475,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def live_updates(self):
         collector = self.source().collector
-        if not collector or not collector.full_pass:
+        if not collector or not collector.full_pass or not collector.collection_enabled:
             self.send_response(204)
             self.end_headers()
             return
@@ -424,7 +488,7 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             while True:
                 revision = collector.wait_for_snapshot(previous)
-                if collector.stop_event.is_set():
+                if not collector.collection_enabled:
                     self.wfile.write(b"event: stopped\ndata: {}\n\n")
                     self.wfile.flush()
                     return
@@ -439,8 +503,14 @@ class Handler(SimpleHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == CONNECTION_PATH:
             return self.connect_hpc()
+        if path == COLLECTION_PATH:
+            return self.change_live_collection()
         if path == CHAT_PATH:
             return self.chat()
+        if path == CHAT_PAGE_PATH:
+            return self.chat_page()
+        if path == LIVE_JOB_PATH:
+            return self.live_job()
         if path == JOB_DETAIL_PATH:
             return self.chat_job_detail()
         if path == "/api/v1/diagnoses":
@@ -454,7 +524,10 @@ class Handler(SimpleHTTPRequestHandler):
             try:
                 source = self.source()
                 narrator = self.server.narrator if source.kind == "hpc_api" else None
-                outcome = DiagnosisService(source, narrator=narrator, threshold=self.server.threshold).diagnose(payload)
+                with ForegroundSource(source) as foreground:
+                    outcome = DiagnosisService(foreground, narrator=narrator, threshold=self.server.threshold).diagnose(payload)
+            except CollectionConflict:
+                return self.send_json(409, COLLECTION_CONFLICT)
             except (TypeError, ValueError, AttributeError, KeyError):
                 outcome = error_response("UPSTREAM_ERROR", "作业或监控数据结构无法识别。")
             return self.send_json(*outcome)
@@ -471,6 +544,63 @@ class Handler(SimpleHTTPRequestHandler):
         except (ValueError, TypeError, KeyError, AttributeError):
             return self.send_json(400, {"error": "请输入有效的 Slurm 作业 JSON"})
         self.send_json(200, result)
+
+    def live_job(self):
+        if not self.same_origin() or self.headers.get_content_type() != "application/json":
+            return self.send_json(403, {"message": "请通过看板读取实时作业数据。"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 256:
+                raise ValueError
+            payload = json.loads(self.rfile.read(length))
+            job_id, started = payload["job_id"], payload.get("started_at")
+            if (not isinstance(job_id, str) or not re.fullmatch(r"[1-9][0-9]{0,15}", job_id)
+                    or started is not None and (type(started) is not int or not epoch(started))):
+                raise ValueError
+        except (KeyError, AttributeError, TypeError, ValueError):
+            return self.send_json(400, {"message": "单作业监控请求无效。"})
+        source = self.source()
+        if source.kind == "disconnected" or not source.collector:
+            return self.send_json(401, {"message": "请先连接 SJTU HPC。"})
+        try:
+            result = source.collector.sample_job(int(job_id), started)
+        except CollectionConflict:
+            return self.send_json(409, COLLECTION_CONFLICT)
+        except SlurmJobsError as issue:
+            statuses = {"invalid_hpc_token": 401, "permission_denied": 403, "hpc_timeout": 504}
+            return self.send_json(statuses.get(issue.code, 502), {"message": str(issue)})
+        return self.send_json(200, result)
+
+    def chat_page(self):
+        if not self.same_origin() or self.headers.get_content_type() != "application/json":
+            return self.send_json(403, {"message": "请通过本地页面查看查询结果。"})
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= 512:
+                raise ValueError
+            payload = json.loads(self.rfile.read(length))
+            chat_id, page_id, page = payload["chat_id"], payload["page_id"], payload["page"]
+            if (not isinstance(chat_id, str) or not CHAT_ID.fullmatch(chat_id)
+                    or not isinstance(page_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{22}", page_id)
+                    or type(page) is not int or page < 1):
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            return self.send_json(400, {"message": "页码或查询结果标识无效。"})
+        session, connected = self.browser_connection()
+        with self.server.chat_lock:
+            state = self.server.chat_states.get((session if connected else None, chat_id))
+            saved = state.result_pages.get(page_id) if state else None
+        if saved is None:
+            return self.send_json(404, {"message": "这一轮结果已过期，请重新查询。"})
+        rows, live = saved
+        pages = (len(rows) + PAGE_SIZE - 1) // PAGE_SIZE
+        if page > pages:
+            return self.send_json(400, {"message": "页码超出了本次结果的范围。"})
+        offset = (page - 1) * PAGE_SIZE
+        records = rows[offset:offset + PAGE_SIZE]
+        if not live:
+            records = [public_row(row) for row in records]
+        return self.send_json(200, {"records": records, "page": page, "pages": pages, "offset": offset})
 
     def chat_job_detail(self):
         if not self.same_origin() or self.headers.get_content_type() != "application/json":
@@ -503,10 +633,13 @@ class Handler(SimpleHTTPRequestHandler):
         session, connected = self.browser_connection()
         with self.server.chat_lock:
             state = self.server.chat_states.get((session if connected else None, chat_id))
-        workflow = ConversationRun(state or ChatState(), connected or self.server.source, self.server.archive,
-                                   threshold=self.server.threshold, memory_schema=self.server.memory_schema)
         try:
-            result = workflow.inspect_job(job_id, job_ref, point_at)
+            with ForegroundSource(connected or self.server.source) as foreground:
+                workflow = ConversationRun(state or ChatState(), foreground, self.server.archive,
+                                           threshold=self.server.threshold, memory_schema=self.server.memory_schema)
+                result = workflow.inspect_job(job_id, job_ref, point_at)
+        except CollectionConflict:
+            return self.send_json(409, COLLECTION_CONFLICT)
         except (ValueError, TypeError, AttributeError, KeyError):
             return self.send_json(502, {"message": "作业详情的数据结构无法读取。"})
         return self.send_json(200, result)
@@ -558,12 +691,22 @@ class Handler(SimpleHTTPRequestHandler):
 
             # Streaming is on a dedicated ThreadingHTTPServer worker. Demo uses local fixtures only.
             narrator = self.server.narrator if source.kind != "synthetic" else None
-            workflow = ConversationRun(state, source, self.server.archive, narrator,
-                                       threshold=self.server.threshold, emit=emit, memory_schema=self.server.memory_schema)
             try:
-                result = workflow.run(question.strip(), mode)
+                with ForegroundSource(source) as foreground:
+                    workflow = ConversationRun(state, foreground, self.server.archive, narrator,
+                                               threshold=self.server.threshold, emit=emit, memory_schema=self.server.memory_schema)
+                    result = workflow.run(question.strip(), mode)
+            except CollectionConflict:
+                result = COLLECTION_CONFLICT
             except (ValueError, TypeError, AttributeError, KeyError, SlurmJobsError):
                 result = {"status": "needs_data", "message": "本次查询的作业数据结构无法读取，请缩小范围后重试。"}
+            if result.get("pages", 1) > 1:
+                page_id = token_urlsafe(16)
+                with self.server.chat_lock:
+                    if len(state.result_pages) >= 8:
+                        del state.result_pages[next(iter(state.result_pages))]
+                    state.result_pages[page_id] = (state.ordered, bool(result.get("live")))
+                result["page_id"] = page_id
             emit({"type": "result", "data": result})
             workflow.narrate(result)
             emit({"type": "done"})
@@ -582,7 +725,7 @@ class Handler(SimpleHTTPRequestHandler):
             source = self.server.connections.pop(session_id, None)
         if source:
             source.stop_collection()
-        self.send_json(200, {"source_kind": self.server.source.kind, "connected": False},
+        self.send_json(200, self.connection_status(),
                        cookie=f"{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
 
     def send_json(self, status, data, *, cookie=None):

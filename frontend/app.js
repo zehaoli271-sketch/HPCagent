@@ -2,6 +2,7 @@ const $ = (selector) => document.querySelector(selector);
 const state = {view: 'running', metric: 'cpu', data: null, selected: null, loading: false, request: 0, events: null, pendingRevision: -1, autoRequest: null};
 const elements = {
   grid: $('#grid'), notice: $('#notice'), search: $('#search'), partition: $('#partition'), drawer: $('#drawer'),
+  liveJob: $('#drawer-live-job'),
   sortField: $('#sort-field'), sortOrder: $('#sort-order'), autoRefresh: $('#auto-refresh'),
 };
 const date = (value) => value ? new Date(value).toLocaleString('zh-CN', {hour12: false}) : '未提供';
@@ -39,6 +40,7 @@ function detail(job) {
     rows.push(['分配节点', job.nodes?.join('、') || '未提供'],
       ['CPU 实测窗口', job.cpu_observed_end ? `${date(job.cpu_observed_start)} 至 ${date(job.cpu_observed_end)}` : '待采集'],
       ['内存采样时间', date(job.memory_observed_at)]);
+    if (job.memory_reason) rows.push(['内存效率说明', job.memory_reason]);
   }
   const container = $('#details'); container.replaceChildren();
   for (const [label, value] of rows) {
@@ -50,6 +52,13 @@ function detail(job) {
   const note = document.createElement('div'); note.className = 'detail-reason';
   note.textContent = job.reason || (running ? 'CPU 效率按各分配节点共同覆盖的实测窗口计算。' : '整段运行的平均 CPU 效率。该数值描述 CPU 使用情况，需结合任务特点进一步判断。');
   container.append(note); elements.drawer.hidden = false; renderGrid();
+}
+
+function closeDrawer() {
+  window.hpcLiveJob.stop(elements.liveJob);
+  elements.liveJob.replaceChildren();
+  elements.drawer.hidden = true;
+  state.selected = null;
 }
 
 function compareJobs(first, second) {
@@ -77,7 +86,12 @@ function renderGrid() {
     const observedAt = state.metric === 'cpu' ? job.cpu_observed_end : job.memory_observed_at;
     const observed = observedAt ? ` · 采样截至 ${date(observedAt)}` : '';
     button.title = `作业 ${job.id} · ${metricLabel()} ${percent(ratio)}${observed}`;
-    button.setAttribute('aria-label', button.title); button.addEventListener('click', () => detail(job)); elements.grid.append(button);
+    button.setAttribute('aria-label', button.title);
+    button.addEventListener('click', () => {
+      detail(job);
+      if (job.state === 'RUNNING') window.hpcLiveJob.open(job, elements.liveJob);
+    });
+    elements.grid.append(button);
   }
   $('#plot-count').textContent = state.data?.source_kind === 'disconnected'
     ? '作业列表' : `匹配 ${jobs.length.toLocaleString()} 个作业`;
@@ -109,6 +123,13 @@ function renderMetricSummary() {
   if (data.status === 'warming_up') message = data.updates_on_completion ? '后台正在进行首轮采集。' : '后台正在获取第一批作业与监控样本。';
   if (data.status === 'stale') message = `当前展示已过期快照。 ${message}`;
   if (data.status === 'unavailable') message = data.error?.message || '暂无可用快照。';
+  if (data.catalog_only) {
+    const stale = data.status === 'stale' ? '清单已过期。 ' : '';
+    message = `${stale}Slurm 作业清单 · ${data.jobs.length.toLocaleString('zh-CN')} 条 · CPU 和内存效率等待首轮监控数据。`;
+  }
+  if (data.collection_paused) message = data.snapshot_count || data.catalog_only
+    ? `后台采集已中断。 ${message}`
+    : '后台采集已中断。可在页面顶部开启采集。';
   if (data.catalog_error) message += ` · Slurm 作业列表刷新失败。 ${data.catalog_error.message}`;
   if (data.source_kind === 'synthetic') message = `合成演示数据。 ${message} 查看真实作业请打开普通 PowerShell 中启动的服务网址。`;
   elements.notice.textContent = disconnected ? '请点击右上角的「连接 SJTU HPC」查看作业。' : message;
@@ -120,7 +141,7 @@ function updateRefreshHint() {
 }
 
 function syncLiveUpdates(enabled) {
-  if (!enabled || !elements.autoRefresh.checked || state.view !== 'running') {
+  if (!enabled || !state.data?.queried_at || !elements.autoRefresh.checked || state.view !== 'running') {
     state.events?.close();
     state.events = null;
     state.pendingRevision = -1;
@@ -160,9 +181,10 @@ async function load(refresh = false, automatic = false) {
     const disconnected = data.source_kind === 'disconnected';
     $('#source-label').textContent = synthetic ? '合成演示数据' : disconnected ? '未连接' : '交大超算';
     $('#source-kind').textContent = synthetic ? '合成数据' : disconnected ? '等待连接 SJTU HPC'
+      : data.catalog_only ? 'SLURM'
       : view === 'running' && data.source === 'Slurm + Prometheus' ? 'SLURM + PROMETHEUS' : 'SLURM ACCOUNTING';
     const selected = data.jobs.find(job => job.id === state.selected);
-    if (state.selected && !selected) { state.selected = null; elements.drawer.hidden = true; }
+    if (state.selected && !selected) closeDrawer();
     const previous = elements.partition.value; elements.partition.replaceChildren(new Option('全部分区', ''));
     for (const name of [...new Set(data.jobs.map(job => job.partition))].sort()) elements.partition.add(new Option(name, name));
     if ([...elements.partition.options].some(option => option.value === previous)) elements.partition.value = previous;
@@ -200,7 +222,7 @@ if (location.protocol === 'file:') {
     if (state.view === button.dataset.view) return;
     syncLiveUpdates(false);
     state.autoRequest?.abort();
-    state.request++; state.loading = false; state.view = button.dataset.view; state.data = null; state.selected = null; elements.drawer.hidden = true;
+    state.request++; state.loading = false; state.view = button.dataset.view; state.data = null; closeDrawer();
     viewTabs.forEach(tab => {
       tab.classList.toggle('active', tab === button);
       tab.setAttribute('aria-pressed', String(tab === button));
@@ -236,19 +258,26 @@ if (location.protocol === 'file:') {
     }
   });
   $('#refresh').addEventListener('click', () => load(true));
-  $('#close').addEventListener('click', () => {elements.drawer.hidden = true; state.selected = null; renderGrid();});
+  $('#close').addEventListener('click', () => {closeDrawer(); renderGrid();});
   setInterval(() => {
     if (!state.events || state.events.readyState !== EventSource.OPEN) load(false, true);
   }, 10000);
   document.addEventListener('heatmap-restored', () => load(false, Boolean(state.data)));
+  document.addEventListener('hpc-collection-changed', () => {
+    if (state.view !== 'running' || $('#home-view').hidden) return;
+    syncLiveUpdates(false);
+    state.autoRequest?.abort();
+    state.request++;
+    state.loading = false;
+    load();
+  });
   document.addEventListener('hpc-source-changed', () => {
     syncLiveUpdates(false);
     state.autoRequest?.abort();
     state.request++;
     state.loading = false;
     state.data = null;
-    state.selected = null;
-    elements.drawer.hidden = true;
+    closeDrawer();
     elements.partition.replaceChildren(new Option('全部分区', ''));
     $('#total').textContent = '—'; $('#available').textContent = '—'; $('#updated').textContent = '—';
     $('#source-time').textContent = '等待数据';

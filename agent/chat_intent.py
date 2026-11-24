@@ -100,6 +100,11 @@ def parse_intent(question, previous=None, *, now=None, default_threshold=0.2):
         raise TimeInputError("请补充明确的日期范围，例如“最近 7 天”或“11 月 10 日到 15 日”。")
 
     ids = tuple(dict.fromkeys(int(match[1]) for match in ID.finditer(question)))
+    if not ids and period is None:
+        direct = re.search(r"(?:查询|查看|看一下|分析)\s*([1-9][0-9]{0,15})(?![0-9])"
+                           r"(?=\s*(?:的)?\s*(?:实时|当前|现在|运行中|CPU|内存|效率))", question, re.I)
+        if direct:
+            ids = (int(direct[1]),)
     if ids and re.search(r"对比|比较", question) and period is None:
         # Only accept unmarked numbers in an explicitly identified ID comparison.
         ids = tuple(dict.fromkeys((*ids, *(int(value) for value in BARE_ID.findall(question + " ")))))
@@ -179,9 +184,9 @@ def parse_intent(question, previous=None, *, now=None, default_threshold=0.2):
     if not 0 < threshold <= 1:
         raise TimeInputError("请输入大于 0%、且不超过 100% 的利用率阈值。")
     metric = intent.metric
-    if re.search(r"内存.*(?:过量|冗余|低效|利用率|浪费)|(?:过量|冗余|低效|浪费).*内存", question):
+    if re.search(r"内存.*(?:过量|冗余|低效|利用率|效率|浪费)|(?:过量|冗余|低效|浪费).*内存", question):
         metric = "memory"
-    elif re.search(r"CPU.*(?:利用率|效率|浪费|低效)|最低效|低效|最严重|申请.*实际|不匹配", question, re.I):
+    elif re.search(r"CPU.*(?:利用率|效率|浪费|低效)|(?:当前|实时).*效率|最低效|低效|最严重|申请.*实际|不匹配", question, re.I):
         metric = "cpu"
     if re.search(r"取消低效筛选|全部作业|所有作业", question) and not re.search(r"低效|利用率|浪费", question):
         metric = None

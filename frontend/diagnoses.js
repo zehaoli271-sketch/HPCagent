@@ -25,6 +25,22 @@
   let pendingDetail;
   let chatId = crypto.randomUUID();
 
+  async function withCollectionDecision(query, signal, feedback) {
+    const response = await query();
+    if (response !== null || signal.aborted) return response;
+
+    feedback.textContent = '等待确认是否中断后台采集…';
+    const accepted = await window.hpcCollection.confirmInterrupt(signal);
+    if (!accepted || signal.aborted) return null;
+    feedback.textContent = '正在中断后台采集…';
+    await window.hpcCollection.setEnabled(false);
+    if (signal.aborted) return null;
+    feedback.textContent = '后台采集已中断，正在继续查询…';
+    const retry = await query();
+    if (retry === null) throw new Error('后台采集已重新开始，请重新提交查询。');
+    return retry;
+  }
+
   function element(tag, text, className) {
     const node = document.createElement(tag);
     if (text != null) node.textContent = text;
@@ -37,7 +53,13 @@
     const output = element('table', null, 'diagnosis-table');
     const head = output.createTHead().insertRow();
     headers.forEach(value => head.append(element('th', value)));
-    const body = output.createTBody();
+    fillTable(output.createTBody(), rows);
+    viewport.append(output);
+    return viewport;
+  }
+
+  function fillTable(body, rows) {
+    body.replaceChildren();
     rows.forEach(values => {
       const row = body.insertRow();
       values.forEach(value => {
@@ -47,8 +69,6 @@
         row.append(cell);
       });
     });
-    viewport.append(output);
-    return viewport;
   }
 
   function percent(value) {
@@ -69,6 +89,7 @@
   async function openJob(row, {pointAt, full, legacy, live} = {}) {
     pendingDetail?.abort();
     pendingDetail = null;
+    window.hpcLiveJob.stop();
     jobTitle.textContent = `作业 ${row.job_id} 详情`;
     jobStatus.textContent = '';
     jobStatus.classList.remove('error');
@@ -76,6 +97,9 @@
     if (!jobDialog.open) jobDialog.showModal();
     if (live) {
       renderLiveDetail(row, jobContent);
+      const monitor = element('div');
+      jobContent.prepend(monitor);
+      window.hpcLiveJob.open(row, monitor);
       return;
     }
     if (full) {
@@ -90,16 +114,24 @@
     pendingDetail = controller;
     jobStatus.textContent = '正在读取作业和步骤记录…';
     try {
-      const response = await fetch('/api/v1/job-detail', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({job_id: String(row.job_id), job_ref: row.job_ref, chat_id: chatId, point_at: pointAt}),
-        signal: controller.signal,
-      });
-      if (response.status === 404) throw new Error('请重启本地服务，加载新版作业详情。');
-      const data = await response.json();
+      const data = await withCollectionDecision(async () => {
+        const response = await fetch('/api/v1/job-detail', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({job_id: String(row.job_id), job_ref: row.job_ref, chat_id: chatId, point_at: pointAt}),
+          signal: controller.signal,
+        });
+        if (response.status === 404) throw new Error('请重启本地服务，加载新版作业详情。');
+        const detail = await response.json();
+        if (response.status === 409 && detail.status === 'collection_conflict') return null;
+        if (!response.ok) throw new Error(detail.message || '暂时无法读取作业详情。');
+        return detail;
+      }, controller.signal, jobStatus);
       if (pendingDetail !== controller || !jobDialog.open) return;
-      if (!response.ok) throw new Error(data.message || '暂时无法读取作业详情。');
+      if (data === null) {
+        jobStatus.textContent = '查询已取消。';
+        return;
+      }
       if (!data.details?.length) {
         jobStatus.textContent = data.message;
         list(jobContent, '数据说明', data.notes);
@@ -330,10 +362,9 @@
     }
     if (data.records?.length) {
       const memoryHeader = data.records[0].memory_basis === 'seff' ? 'seff 估算 / 申请内存' : '并发峰值 / 申请内存';
-      target.append(table(['序号', '作业 ID', '状态', '分区', 'CPU 利用率', memoryHeader, '有效运行秒数'],
-        data.records.map((row, index) => [data.offset + index + 1, jobButton(row), row.state, row.partition,
-          percent(row.cpu_ratio), percent(row.memory_ratio), row.active_seconds])));
-      if (data.pages > 1) renderPagination(data, target);
+      renderRecords(data, target, ['序号', '作业 ID', '状态', '分区', 'CPU 利用率', memoryHeader, '有效运行秒数'],
+        (row, number) => [number, jobButton(row), row.state, row.partition,
+          percent(row.cpu_ratio), percent(row.memory_ratio), row.active_seconds]);
     }
     if (data.point_evidence) renderScreening(data.point_evidence, target);
     const comparisonJobs = data.details?.length > 1 ? data.details : data.peer_reference ? [data.peer_reference] : [];
@@ -358,10 +389,14 @@
       target.append(title);
       renderLiveDetail(data.live_detail, target);
     } else if (data.records?.length) {
-      target.append(table(['序号', '作业 ID', '分区', 'CPU 窗口效率', '观测内存用量', '内存用量 / 分配'],
-        data.records.map((row, index) => [data.offset + index + 1, jobButton(row, {live: true}), row.partition,
-          percent(row.efficiency), displayGib(row.memory_used_bytes), percent(row.memory_ratio)])));
-      if (data.pages > 1) renderPagination(data, target);
+      renderRecords(data, target, ['序号', '作业 ID', '分区', 'CPU 窗口效率', '观测内存用量', '内存用量 / 分配'],
+        (row, number) => [number, jobButton(row, {live: true}), row.partition,
+          percent(row.efficiency), displayGib(row.memory_used_bytes), percent(row.memory_ratio)]);
+    }
+    if (data.monitor_job) {
+      const monitor = element('div');
+      target.append(monitor);
+      window.hpcLiveJob.open(data.monitor_job, monitor);
     }
     list(target, '数据说明', data.notes);
   }
@@ -378,21 +413,59 @@
       ['内存参考时间', displayTime(row.memory_observed_at)], ['节点样本最大时间差（秒）', displayNumber(row.memory_max_skew_seconds)],
     ]));
     if (row.reason) target.append(element('p', row.reason, 'diagnosis-meta'));
+    if (row.memory_reason) target.append(element('p', row.memory_reason, 'diagnosis-meta'));
     list(target, '复核建议', row.advice);
   }
 
-  function renderPagination(data, target) {
-    const paging = element('p', `第 ${data.page} / ${data.pages} 页 `, 'diagnosis-meta');
-    for (const [label, page] of [['上一页', data.page - 1], ['下一页', data.page + 1]]) {
-      if (page < 1 || page > data.pages) continue;
-      const button = element('button', label, 'refresh');
-      button.type = 'button';
-      button.addEventListener('click', () => {
-        if (target.parentElement === result.lastElementChild) run(`第 ${page} 页`);
-      });
-      paging.append(button);
+  function renderRecords(data, target, headers, mapRow) {
+    const rowsFor = page => page.records.map((row, index) => mapRow(row, page.offset + index + 1));
+    const viewport = table(headers, rowsFor(data));
+    target.append(viewport);
+    if (!data.page_id || data.pages <= 1) return;
+
+    const id = chatId;
+    const pager = element('nav', null, 'diagnosis-pager');
+    pager.setAttribute('aria-label', '结果分页');
+    const label = element('span', null, 'diagnosis-meta');
+    const error = element('span', null, 'diagnosis-meta');
+    error.setAttribute('role', 'status');
+    const previous = element('button', '上一页', 'refresh');
+    const next = element('button', '下一页', 'refresh');
+    previous.type = next.type = 'button';
+    let page = data.page;
+
+    function showPage() {
+      label.textContent = `第 ${page} / ${data.pages} 页`;
+      previous.disabled = page <= 1;
+      next.disabled = page >= data.pages;
     }
-    target.append(paging);
+
+    async function goTo(number) {
+      previous.disabled = next.disabled = true;
+      error.textContent = '';
+      try {
+        const response = await fetch('/api/v1/chat-page', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({chat_id: id, page_id: data.page_id, page: number}),
+        });
+        const nextPage = await response.json();
+        if (!response.ok) throw new Error(nextPage.message || '无法加载这一页。');
+        fillTable(viewport.querySelector('tbody'), rowsFor(nextPage));
+        page = nextPage.page;
+      } catch (issue) {
+        error.textContent = issue.message;
+      } finally {
+        showPage();
+      }
+    }
+
+    previous.addEventListener('click', () => goTo(page - 1));
+    next.addEventListener('click', () => goTo(page + 1));
+    label.setAttribute('aria-live', 'polite');
+    pager.append(label, previous, next, error);
+    target.append(pager);
+    showPage();
   }
 
   function renderJobDetail(row, target, linked = true) {
@@ -423,6 +496,60 @@
     list(target, '人工复核建议', row.suggestions);
   }
 
+  async function streamAnswer(body, controller, answer, narrative, prompt) {
+    const response = await fetch('/api/v1/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body,
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error((await response.json()).message || '诊断请求失败。');
+    if (!response.headers.get('content-type')?.startsWith('application/x-ndjson') || !response.body) {
+      throw new Error('当前服务不支持对话流，请确认本地服务使用的是新版代码。');
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let complete = false;
+    let rendered = false;
+    let conflict = false;
+    while (pending === controller) {
+      const {done, value: chunk} = await reader.read();
+      if (done || pending !== controller) break;
+      buffer += decoder.decode(chunk, {stream: true});
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (!line) continue;
+        const event = JSON.parse(line);
+        if (event.type === 'progress') {
+          const failed = event.timed_out ? `，超时 ${event.timed_out} 个` : '';
+          const progress = event.total == null ? '' : `（已完成 ${event.completed} / ${event.total} 窗口${failed}）`;
+          status.textContent = event.message + progress;
+        } else if (event.type === 'result') {
+          if (event.data.status === 'collection_conflict') {
+            conflict = true;
+          } else {
+            renderReport(event.data, answer, prompt);
+            rendered = true;
+          }
+        } else if (event.type === 'delta') {
+          if (!narrative.isConnected) {
+            answer.append(element('h4', '致远一号解读'), narrative);
+          }
+          narrative.append(document.createTextNode(event.text));
+        } else if (event.type === 'notice') {
+          answer.append(element('p', event.message, 'diagnosis-meta'));
+        } else if (event.type === 'done') {
+          complete = true;
+        }
+      }
+    }
+    if (pending !== controller) return;
+    if (!complete) throw new Error(rendered ? '连接提前结束，已收到的查询结果已保留。' : '查询连接中断，请重试。');
+    return conflict ? null : true;
+  }
+
   async function run(value = question.value) {
     if (pending) return;
     const prompt = value.trim();
@@ -432,6 +559,7 @@
       return;
     }
     const controller = new AbortController();
+    window.hpcLiveJob.stop();
     pending = controller;
     const turn = element('article', null, 'diagnosis-turn');
     const answer = element('div', null, 'diagnosis-turn-answer');
@@ -443,52 +571,13 @@
     status.classList.remove('error');
     status.textContent = '正在发送查询…';
     submit.disabled = true;
+    const body = JSON.stringify({question: prompt, mode: mode.value, chat_id: chatId});
     try {
-      const response = await fetch('/api/v1/chat', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({question: prompt, mode: mode.value, chat_id: chatId}),
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error((await response.json()).message || '诊断请求失败。');
-      if (!response.headers.get('content-type')?.startsWith('application/x-ndjson') || !response.body) {
-        throw new Error('当前服务不支持对话流，请确认本地服务使用的是新版代码。');
-      }
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let complete = false;
-      let rendered = false;
-      while (pending === controller) {
-        const {done, value: chunk} = await reader.read();
-        if (done || pending !== controller) break;
-        buffer += decoder.decode(chunk, {stream: true});
-        const lines = buffer.split('\n');
-        buffer = lines.pop();
-        for (const line of lines) {
-          if (!line) continue;
-          const event = JSON.parse(line);
-          if (event.type === 'progress') {
-            const failed = event.timed_out ? `，超时 ${event.timed_out} 个` : '';
-            const progress = event.total == null ? '' : `（已完成 ${event.completed} / ${event.total} 窗口${failed}）`;
-            status.textContent = event.message + progress;
-          } else if (event.type === 'result') {
-            renderReport(event.data, answer, prompt);
-            rendered = true;
-          } else if (event.type === 'delta') {
-            if (!narrative.isConnected) {
-              answer.append(element('h4', '致远一号解读'), narrative);
-            }
-            narrative.append(document.createTextNode(event.text));
-          } else if (event.type === 'notice') {
-            answer.append(element('p', event.message, 'diagnosis-meta'));
-          } else if (event.type === 'done') {
-            complete = true;
-          }
-        }
-      }
+      const outcome = await withCollectionDecision(
+        () => streamAnswer(body, controller, answer, narrative, prompt), controller.signal, status,
+      );
       if (pending !== controller) return;
-      if (!complete) throw new Error(rendered ? '连接提前结束，已收到的查询结果已保留。' : '查询连接中断，请重试。');
+      if (outcome === null) answer.append(element('p', '查询已取消。', 'diagnosis-meta'));
       status.textContent = '';
     } catch (error) {
       if (error.name !== 'AbortError' && pending === controller) {
@@ -507,6 +596,7 @@
 
   function showView(showDiagnosis, focus = true) {
     if (home.hidden === showDiagnosis) return;
+    window.hpcLiveJob.stop();
     home.hidden = showDiagnosis;
     diagnosis.hidden = !showDiagnosis;
     dashboardButton.setAttribute('aria-pressed', String(!showDiagnosis));
@@ -545,10 +635,12 @@
   });
   form.addEventListener('submit', event => { event.preventDefault(); run(); });
   jobDialog.addEventListener('close', () => {
+    window.hpcLiveJob.stop(jobContent);
     pendingDetail?.abort();
     pendingDetail = null;
   });
   document.addEventListener('hpc-source-changed', () => {
+    window.hpcLiveJob.stop();
     pending?.abort();
     pending = null;
     pendingDetail?.abort();

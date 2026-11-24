@@ -51,6 +51,7 @@ class ChatState:
     selected: dict | None = None
     latest_point: dict | None = None
     live_frame: dict | None = None
+    result_pages: dict = field(default_factory=dict, repr=False)
 
 
 def sorted_rows(rows, intent):
@@ -138,7 +139,9 @@ class ConversationRun:
         continued = frame is self.state.live_frame and continued
         status = frame["status"]
         rows = frame["jobs"]
-        notes = []
+        catalog_only = frame.get("catalog_only", False)
+        paused = current.get("collection_paused", False)
+        notes = ["后台采集已中断，以下为最近一次已发布的记录。"] if paused and frame["snapshot_count"] else []
         if frame.get("error"):
             notes.append(frame["error"]["message"])
         if frame.get("catalog_error"):
@@ -149,12 +152,18 @@ class ConversationRun:
             notes.extend(f"{reason}（{count} 条）" for reason, count in coverage.get("cpu_gaps", {}).items())
         if coverage.get("ambiguous_jobs"):
             notes.append(f"{coverage['ambiguous_jobs']} 个作业 ID 有多种分配记录，暂未纳入筛查。")
-        if status in {"warming_up", "unavailable", "stale"}:
+        if status in {"warming_up", "unavailable", "stale", "paused"}:
             message = {"warming_up": "后台正在采集第一批实时样本。",
                        "unavailable": "当前没有可用的实时作业快照。",
+                       "paused": "后台采集已中断。可在页面顶部开启采集。",
                        "stale": "当前采集已过期，以下为最近一次记录。"}[status]
         else:
             message = ""
+        if catalog_only:
+            catalog_label = "已过期的 Slurm 作业清单" if status == "stale" else "Slurm 作业清单"
+            message = f"已读取{catalog_label}。CPU 和内存效率等待首轮监控数据。"
+            if paused:
+                message = f"后台采集已中断。{message}"
         if intent.job_ids:
             rows = [row for row in rows if row["job_id"] in intent.job_ids]
             if not rows and status in {"ready", "partial"}:
@@ -166,7 +175,7 @@ class ConversationRun:
         metric = "memory_ratio" if intent.metric == "memory" else "efficiency"
         metric_time = "memory_observed_at" if metric == "memory_ratio" else "cpu_observed_end"
         measured = [row for row in rows if row[metric] is not None]
-        if frame.get("updates_on_completion") and intent.live_filter:
+        if (frame.get("updates_on_completion") or paused) and intent.live_filter:
             current_measurements = [row for row in measured if row.get(metric_time)
                                     and (self.now - datetime.fromisoformat(row[metric_time])).total_seconds() <= WINDOW_SECONDS]
             expired = len(measured) - len(current_measurements)
@@ -177,7 +186,7 @@ class ConversationRun:
         total = len(rows)
         if continued:
             rows = self.state.ordered
-        elif intent.live_filter and intent.metric and status in {"ready", "partial"}:
+        elif intent.live_filter and intent.metric and (status in {"ready", "partial"} or catalog_only):
             rows = [row for row in measured if intent.rank_only or row[metric] < intent.threshold]
             rows = sorted(rows, key=lambda row: (row[metric], row["job_id"]))
         else:
@@ -217,14 +226,18 @@ class ConversationRun:
             if selected["memory_ratio"] is not None and selected["memory_ratio"] < intent.threshold:
                 advice.append("对照峰值阶段和多次运行的内存用量，再评估是否减少申请。")
             selected = {**selected, "advice": advice}
+        monitor_job = (selected or {"job_id": priority}) if priority and intent.metric and not intent.live_filter else None
+        if monitor_job:
+            message = f"作业 {priority} 的实时效率会在单作业监控中更新。"
         self.state.intent, self.state.live_frame = replace(intent, page=page), frame
         self.state.ordered, self.state.data, self.state.latest_point, self.state.selected = rows, None, None, None
         self.result = {
             "status": "complete" if status in {"ready", "partial"} else "needs_data", "message": message,
-            "source": SOURCE["synthetic"] if self.source.kind == "synthetic" else "Slurm + Prometheus",
+            "source": SOURCE["synthetic"] if self.source.kind == "synthetic" else frame.get("source", "Slurm + Prometheus"),
             "fetched_at": frame["queried_at"], "notes": notes, "live": True, "live_status": status,
             "coverage": coverage, "records": rows[offset:offset + PAGE_SIZE], "offset": offset,
             "page": page, "pages": pages, "live_detail": selected, "snapshot_count": frame.get("snapshot_count", 0),
+            "monitor_job": monitor_job,
         }
         return ToolSuccess({"matching": total}, ToolEvidence(self.source.kind, intent.scope(), frame["queried_at"] or self.now.isoformat()))
 
